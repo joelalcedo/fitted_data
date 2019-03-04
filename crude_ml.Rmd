@@ -1,0 +1,330 @@
+---
+title: "Crude oil trading model"
+output: html_notebook
+---
+
+```{r}
+
+library(tidyverse)
+library(Rblpapi)
+library(xgboost)
+library(zoo)
+library(data.table)
+library(TTR)
+library(lubridate)
+
+```
+
+
+```{r}
+
+blpConnect()
+
+cl1 <- bdh(securities = "CL1 COMB Comdty", fields = c("PX_LOW", "PX_HIGH",  "PX_LAST"), start.date = today()-years(100)) %>% 
+  
+cl1 %>% filter(is.na(PX_LOW)|is.na(PX_HIGH))
+
+```
+
+#feature engineering
+```{r}
+library(TTR)
+library(zoo)
+
+macd <- 
+TTR::MACD(cl1$PX_LAST, percent = T) %>% 
+  as.tibble() %>% 
+  mutate(date=cl1$date) %>% 
+  select(date, signal)
+
+rsi <- 
+TTR::RSI(cl1$PX_LAST) %>% 
+  as.tibble() %>%
+  mutate(date=cl1$date) %>% 
+  rename(rsi=1)  
+
+uo_dat <- cl1 %>% filter(date>'2000-01-01') %>% select(date, PX_HIGH, PX_LOW, PX_LAST)
+ultimate_oscillator <- 
+  TTR::ultimateOscillator(HLC = uo_dat[-1], n = c(7, 14, 28), wts = c(4, 2, 1)) %>% 
+  as.tibble() %>% 
+  mutate(date = uo_dat$date)
+rm(uo_dat)
+
+ultimate_oscillator%>%ggplot()+geom_line(aes(date, value))
+
+realized_vol <- cl1 %>%
+  select(date, PX_LAST) %>% 
+  mutate(vol30 = PX_LAST/lag(PX_LAST),
+         vol30 =  rollapplyr(vol30, FUN = sd, width = 30, fill = NA),
+         vol30 = vol30*sqrt(260),
+         vol90 = PX_LAST/lag(PX_LAST),
+         vol90 =  rollapplyr(vol90, FUN = sd, width = 90, fill = NA),
+         vol90 = vol90*sqrt(260)) %>% 
+  mutate(vol_variance = (vol90*100)/(vol30*100)-1)  %>% 
+  select(-PX_LAST)
+
+onemonth <- 
+bdh(securities = "CL1 Comdty", fields = c("1ST_MTH_IMPVOL_90.0%MNY_DF", "1ST_MTH_IMPVOL_110.0%MNY_DF"), start.date = today()-years(100)) %>%  mutate(onemodif = `1ST_MTH_IMPVOL_110.0%MNY_DF`/`1ST_MTH_IMPVOL_90.0%MNY_DF`-1) 
+  
+twomonth <- 
+bdh(securities = "CL1 Comdty", fields = c("2ND_MTH_IMPVOL_90.0%MNY_DF", "2ND_MTH_IMPVOL_110.0%MNY_DF"), start.date = today()-years(100)) %>%  mutate(twomodif = `2ND_MTH_IMPVOL_110.0%MNY_DF`/`2ND_MTH_IMPVOL_90.0%MNY_DF`-1) 
+
+threemonth <- 
+bdh(securities = "CL1 Comdty", fields = c("3MTH_IMPVOL_90.0%MNY_DF", "3MTH_IMPVOL_110.0%MNY_DF"), start.date = today()-years(100)) %>%  mutate(threemodif = `3MTH_IMPVOL_110.0%MNY_DF`/`3MTH_IMPVOL_90.0%MNY_DF`-1) #%>%
+  # ggplot() + 
+  # geom_line(aes(date, difference))
+
+
+ma_matrix <- cl1 %>% select(1, 4) %>% 
+  mutate(levelchange5 = PX_LAST-lag(PX_LAST,5),
+         levelchange15 = PX_LAST-lag(PX_LAST,15),
+         levelchange50 = PX_LAST-lag(PX_LAST,50),
+         levelchange100 = PX_LAST-lag(PX_LAST,100),
+         levelchange200 = PX_LAST-lag(PX_LAST, 200),
+         ma5 = SMA(PX_LAST, 5), 
+         ma15 = SMA(PX_LAST, 15), 
+         ma50 = SMA(PX_LAST, 50), 
+         ma100 = SMA(PX_LAST, 100), 
+         ma200 = SMA(PX_LAST, 200)) %>% 
+  select(-PX_LAST)
+
+technical_indicators <- 
+  macd %>% 
+  full_join(rsi, by = "date") %>% 
+  full_join(realized_vol, by = "date") %>%
+  melt(id.var = 1) %>%
+  group_by(variable) %>% 
+  mutate(change = value/lag(value, 10)) %>% 
+  rename(variable1=variable) %>%
+  melt(id.var = c(1, 2)) %>% 
+  mutate(variable = paste(variable1, variable, sep = "_")) %>% 
+  dcast(date~variable, value.var = "value") %>% 
+  full_join(ma_matrix, by = "date")
+  # full_join(onemonth) %>%
+  # full_join(twomonth) %>%
+  # full_join(threemonth)
+  
+technical_indicators %>% 
+  melt(id.var=1) %>% 
+  ggplot() +
+  geom_line(aes(date, value)) +
+  facet_wrap(variable~., scales = "free")
+
+
+```
+
+
+
+#Macro variables
+```{r}
+
+weekly_crude_inventories <- 
+bdh(securities = 'DOEASCRD Index', fields = c("ECO_RELEASE_DT", "PX_LAST"), start.date = today()-years(100)) %>%
+  mutate(date=ECO_RELEASE_DT) %>%
+  na.omit() %>% 
+  select(-ECO_RELEASE_DT) %>% 
+  rename(crude_inventory=2) %>% 
+  mutate(release = paste("Release", 1:nrow(.)))
+
+blpConnect()
+
+'CONCCONF Index' %>%
+  bdh(securities = ., fields = c("ECO_RELEASE_DT", "PX_LAST"), start.date = today()-years(100)) %>% 
+  mutate(date=ECO_RELEASE_DT) %>%
+  na.omit() %>% 
+  select(-ECO_RELEASE_DT) %>% 
+  rename(crude_inventory=2) %>% 
+  mutate(release = paste("Release", 1:nrow(.)))
+
+
+weekly_crude_inventories %>% 
+  ggplot() +
+  geom_line(aes(date, crude_inventory))
+
+bds(security = "DOESCRUD Index",  field = "ECO_RELEASE_DT_LIST")
+
+```
+
+#Tanker data
+```{r}
+
+alt_tickers <- 
+tribble(
+~name, ~ticker,  
+'vessels_in_service', 'VESLCOIS Index',
+'dwt_crude_vessels', 'VESLCODW Index',
+'vessels_on_order', 'VESLCOOO Index', 
+'vessel_orderbook', 'VESLCOPC Index'
+)
+
+alt_data <- NULL  
+
+for(i in 1:nrow(alt_tickers)){
+  alt_data <- 
+    bdh(securities = alt_tickers$ticker[i], fields = c("PX_LAST"), start.date = today()-years(100)) %>% 
+    mutate(name = alt_tickers$name[i]) %>%
+    rbind(alt_data)
+  }
+
+alt_data %>% 
+  group_by(name) %>% 
+  # mutate(change = PX_LAST/lag(PX_LAST)-1) %>% 
+  ggplot() +
+  geom_line(aes(date, PX_LAST)) +
+  facet_wrap(name~., scales = "free")
+
+
+```
+
+
+
+# model 
+```{r}
+
+dataset <- 
+cl1 %>% select(date, PX_LAST) %>% rename(y=PX_LAST) %>% 
+  mutate(week = paste("Week ",week(date), sep = ""),
+         month = month(date, label = T, abbr = F)) %>% 
+  mutate(key = 1) %>%
+  spread(key = month, value = key, fill = 0) %>% 
+  mutate(key = 1) %>%
+  spread(key = week, value = key, fill = 0) %>% 
+  full_join(technical_indicators) %>% 
+  na.omit() %>% 
+  # tail() %>% 
+  select(-y)
+
+dataset%>%tail()
+
+```
+
+# Model - build a long / short signal. When tomorrow's close is >0, long, when <0, short 
+```{r}
+
+dataset 
+
+signal <- 
+cl1 %>% select(date, PX_LAST) %>% rename(y=PX_LAST) %>% 
+  mutate(price_change = y/lag(y)-1) %>% 
+  na.omit() %>% 
+  mutate(y = lead(y),
+         price_change = lead(price_change),
+         tradesignal = case_when(
+           price_change==0~0,
+           price_change<0~ -1,
+           price_change>0~ 1
+         )) %>% 
+  select(date, tradesignal=y)
+
+model_data <- 
+dataset %>%
+  inner_join(signal) %>%
+  na.omit()
+
+tomorrow <- 
+dataset %>%
+  inner_join(signal) %>%
+  # na.omit() %>% 
+  filter(is.na(tradesignal)) %>%
+  select(-tradesignal)
+
+tomorrow_xgb <- xgb.DMatrix(data =  as.matrix(tomorrow[,-1]))
+
+subset <-  sample(seq_len(nrow(model_data)), size = floor(0.75 * nrow(model_data)))
+train <- model_data[subset,]
+y_fit <- train["tradesignal"]
+train <- train%>%select(-tradesignal)
+train_xgb <- xgb.DMatrix(data =  as.matrix(train[,-1]), label = y_fit$tradesignal)
+
+test <- model_data[-subset,]
+y_test <- test["tradesignal"]
+test <- test%>%select(-tradesignal)
+test_xgb <- xgb.DMatrix(data =  as.matrix(test[,-1]), label = y_test$tradesignal)
+
+cv.nround <- 1000
+cv.nfold  <- 5
+
+mdcv <- xgb.cv(data=train_xgb, nthread=6, nfold=cv.nfold, nrounds=cv.nround, verbose = T)
+
+min_logloss <-  mdcv$evaluation_log %>% filter(test_rmse_mean==min(test_rmse_mean))
+
+xgboostmodel <-  xgboost(data = train_xgb, nrounds = min_logloss$iter)
+
+xgboost::xgb.importance(model = xgboostmodel)
+
+predict(object = xgboostmodel, newdata = test_xgb) %>% 
+  as.tibble() %>% 
+  mutate(date = test$date) %>% 
+  inner_join(cl1%>%select(1,4)) %>%
+  mutate(resid = value/PX_LAST-1) %>%
+  ggplot() +
+  geom_line(aes(date, value), color = "red") +
+  geom_line(aes(date, PX_LAST), color = "blue") 
+
+predict(xgboostmodel, newdata = tomorrow_xgb)
+
+
+
+```
+
+
+```{r}
+
+fitted_values <- NULL
+
+for(i in 252:nrow(model_data)){
+
+train <- model_data %>% dplyr::slice(1:i)
+y_fit <- train["tradesignal"]
+train <- train%>%select(-tradesignal)
+train_xgb <- xgb.DMatrix(data =  as.matrix(train[,-1]), label = y_fit$tradesignal)
+
+tmw <- i+1
+
+if(tmw>nrow(model_data)){
+  break
+}
+
+tomorrow <- model_data %>% dplyr::slice(tmw) %>% select(-tradesignal)
+tomorrow_xgb <- xgb.DMatrix(data =  as.matrix(tomorrow[,-1]))
+
+cv.nround <- 1000
+cv.nfold  <- 5
+
+mdcv <- xgb.cv(data=train_xgb, nfold=cv.nfold, nrounds=cv.nround, verbose = T, early_stopping_rounds = 50)
+min_logloss <-  mdcv$evaluation_log %>% filter(test_rmse_mean==min(test_rmse_mean))
+xgboostmodel <-  xgboost(data = train_xgb, nrounds = min_logloss$iter)
+
+fitted_values <- 
+predict(xgboostmodel, newdata = tomorrow_xgb) %>% 
+  as.tibble() %>% 
+  mutate(date = tomorrow$date) %>% 
+  rbind(fitted_values)
+
+}
+
+
+fitted_values
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
